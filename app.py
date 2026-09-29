@@ -1,4 +1,4 @@
-"""数字档案长期保存服务：SQLite 多副本、哈希校验、修复与迁移。"""
+"""数字档案长期保存服务：内容寻址共用存储、多副本、哈希校验、修复与迁移。"""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,17 @@ from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
+
+import storage_gc
+from db_schema import ensure_schema
+from storage_rules import (
+    clone_version_files,
+    materialize_corruption,
+    put_blob,
+    register_copy_from_version,
+    register_version_file,
+    repoint_copy_from_donor,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "preservation.db"
@@ -69,83 +80,9 @@ class PreservationStore:
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
-    def init_schema(self) -> None:
+    def init_schema(self) -> dict:
         with self._lock, self.connect() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS users(
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('owner','archivist','auditor'))
-                );
-                CREATE TABLE IF NOT EXISTS archives(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    owner_id TEXT NOT NULL REFERENCES users(id),
-                    retention_until TEXT NOT NULL,
-                    restricted INTEGER NOT NULL DEFAULT 1 CHECK(restricted IN (0,1)),
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS archive_members(
-                    archive_id INTEGER NOT NULL REFERENCES archives(id),
-                    user_id TEXT NOT NULL REFERENCES users(id),
-                    permission TEXT NOT NULL CHECK(permission IN ('read','write')),
-                    PRIMARY KEY(archive_id,user_id)
-                );
-                CREATE TABLE IF NOT EXISTS archive_versions(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    archive_id INTEGER NOT NULL REFERENCES archives(id),
-                    version INTEGER NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'verified' CHECK(state IN ('verified','degraded')),
-                    created_by TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL,
-                    UNIQUE(archive_id,version)
-                );
-                CREATE TABLE IF NOT EXISTS archive_files(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
-                    path TEXT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    content BLOB NOT NULL,
-                    UNIQUE(version_id,path)
-                );
-                CREATE TABLE IF NOT EXISTS copies(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    version_id INTEGER NOT NULL REFERENCES archive_versions(id),
-                    location TEXT NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'healthy' CHECK(state IN ('healthy','corrupt','degraded')),
-                    created_at TEXT NOT NULL,
-                    last_verified_at TEXT,
-                    UNIQUE(version_id,location)
-                );
-                CREATE TABLE IF NOT EXISTS copy_files(
-                    copy_id INTEGER NOT NULL REFERENCES copies(id),
-                    path TEXT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    content BLOB NOT NULL,
-                    PRIMARY KEY(copy_id,path)
-                );
-                CREATE TABLE IF NOT EXISTS migrations(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_version_id INTEGER NOT NULL REFERENCES archive_versions(id),
-                    target_version_id INTEGER NOT NULL UNIQUE REFERENCES archive_versions(id),
-                    source_path TEXT NOT NULL,
-                    target_path TEXT NOT NULL,
-                    target_format TEXT NOT NULL,
-                    actor_id TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS audit_log(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    archive_id INTEGER NOT NULL REFERENCES archives(id),
-                    actor_id TEXT NOT NULL REFERENCES users(id),
-                    action TEXT NOT NULL,
-                    detail TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
+            return ensure_schema(conn)
 
     def seed(self) -> None:
         self.init_schema()
@@ -248,17 +185,20 @@ class PreservationStore:
                     (archive_id, version_no, actor_id, now()),
                 )
                 version_id = cur.lastrowid
+                shared = 0
                 for item in manifest:
-                    conn.execute(
-                        "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
-                        (version_id, item["path"], item["sha256"], item["size"], item["content"]),
-                    )
+                    # 摘要相同共用一份实体，版本清单只登记引用。
+                    created = put_blob(conn, item["sha256"], item["size"], item["content"])
+                    shared += not created
+                    register_version_file(conn, version_id, item["path"], item["sha256"], item["size"])
                 self._audit(
                     conn, archive_id, actor_id, "version.ingest",
                     {"version_id": version_id, "version": version_no, "files": len(manifest),
+                     "shared_blobs": shared,
                      "manifest": [{"path": x["path"], "sha256": x["sha256"], "size": x["size"]} for x in manifest]},
                 )
-                return {"id": version_id, "archive_id": archive_id, "version": version_no, "file_count": len(manifest)}
+                return {"id": version_id, "archive_id": archive_id, "version": version_no,
+                        "file_count": len(manifest), "shared_blobs": shared}
             except Exception:
                 conn.rollback()
                 raise
@@ -280,13 +220,11 @@ class PreservationStore:
                     (version_id, location, now(), now()),
                 )
                 copy_id = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO copy_files(copy_id,path,sha256,size,content)
-                       SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
-                    (copy_id, version_id),
-                )
+                # 副本不再复制字节，只登记对同一批内容实体的引用。
+                ref_count = register_copy_from_version(conn, copy_id, version_id)
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
-                return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
+                return {"id": copy_id, "version_id": version_id, "location": location,
+                        "state": "healthy", "file_count": ref_count}
             except sqlite3.IntegrityError:
                 conn.rollback()
                 raise BusinessError("该版本的副本位置已存在", 409, "copy_exists")
@@ -320,10 +258,26 @@ class PreservationStore:
                     raise BusinessError("副本不存在", 404, "not_found")
                 version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
                 self._access(conn, version["archive_id"], user)
+                expected = {r["path"]: r for r in conn.execute(
+                    "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
+                ).fetchall()}
                 stored = conn.execute(
-                    "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (copy_id,)
+                    """SELECT cf.path, cf.sha256 AS ref_sha, cf.size AS ref_size,
+                              b.sha256 AS blob_sha
+                       FROM copy_files cf JOIN content_blobs b ON b.sha256=cf.sha256
+                       WHERE cf.copy_id=? ORDER BY cf.path""",
+                    (copy_id,),
                 ).fetchall()
-                corrupt_paths = [r["path"] for r in stored if hashlib.sha256(r["content"]).hexdigest() != r["sha256"] or len(r["content"]) != r["size"]]
+                stored_by_path = {r["path"]: r for r in stored}
+                # 损坏判定：缺文件/多文件、引用摘要与清单不符、实体字节与摘要不符。
+                corrupt_paths = []
+                for path, ref in stored_by_path.items():
+                    want = expected.get(path)
+                    if want is None or ref["ref_sha"] != want["sha256"] or ref["ref_size"] != want["size"] \
+                            or ref["blob_sha"] != ref["ref_sha"]:
+                        corrupt_paths.append(path)
+                corrupt_paths += [p for p in expected if p not in stored_by_path]
+                corrupt_paths.sort()
                 repaired = False
                 if not corrupt_paths:
                     conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
@@ -337,21 +291,21 @@ class PreservationStore:
                     result_state = "degraded"
                     if healthy:
                         donor = conn.execute(
-                            "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (healthy["id"],)
+                            """SELECT cf.path, cf.sha256 AS ref_sha, cf.size AS ref_size, b.sha256 AS blob_sha
+                               FROM copy_files cf JOIN content_blobs b ON b.sha256=cf.sha256
+                               WHERE cf.copy_id=?""",
+                            (healthy["id"],),
                         ).fetchall()
                         donor_by_path = {r["path"]: r for r in donor}
-                        expected = {r["path"]: r for r in conn.execute(
-                            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
-                        ).fetchall()}
-                        if set(donor_by_path) == set(expected) and all(
-                            hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"] for p in expected
-                        ):
-                            conn.execute("DELETE FROM copy_files WHERE copy_id=?", (copy_id,))
-                            conn.execute(
-                                """INSERT INTO copy_files(copy_id,path,sha256,size,content)
-                                   SELECT ?,path,sha256,size,content FROM copy_files WHERE copy_id=?""",
-                                (copy_id, healthy["id"]),
-                            )
+                        # 修复前先核验供体：文件集合与清单一致，且引用的实体字节健康。
+                        donor_ok = set(donor_by_path) == set(expected) and all(
+                            d["ref_sha"] == expected[p]["sha256"] and d["ref_size"] == expected[p]["size"]
+                            and d["blob_sha"] == d["ref_sha"]
+                            for p, d in donor_by_path.items()
+                        )
+                        if donor_ok:
+                            # 只改引用，共享实体本身从不因损坏被改动。
+                            repoint_copy_from_donor(conn, copy_id, healthy["id"])
                             conn.execute("UPDATE copies SET state='healthy',last_verified_at=? WHERE id=?", (now(), copy_id))
                             repaired, result_state = True, "healthy"
                     if result_state == "degraded":
@@ -374,14 +328,17 @@ class PreservationStore:
                 raise BusinessError("副本不存在", 404, "not_found")
             version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (copy["version_id"],)).fetchone()
             self._access(conn, version["archive_id"], user, require_write=True)
-            row = conn.execute("SELECT content FROM copy_files WHERE copy_id=? AND path=?", (copy_id, path)).fetchone()
-            if not row:
-                raise BusinessError("副本文件不存在", 404, "not_found")
-            damaged = bytes([row["content"][0] ^ 0xFF]) + row["content"][1:] if row["content"] else b"corrupt"
-            conn.execute("UPDATE copy_files SET content=? WHERE copy_id=? AND path=?", (damaged, copy_id, path))
-            conn.execute("UPDATE copies SET state='corrupt' WHERE id=?", (copy_id,))
-            self._audit(conn, version["archive_id"], user_id, "copy.simulate_corruption", {"copy_id": copy_id, "path": path})
-            return {"copy_id": copy_id, "path": path, "state": "corrupt"}
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = materialize_corruption(conn, copy_id, path)
+                if row is None:
+                    raise BusinessError("副本文件不存在", 404, "not_found")
+                conn.execute("UPDATE copies SET state='corrupt' WHERE id=?", (copy_id,))
+                self._audit(conn, version["archive_id"], user_id, "copy.simulate_corruption", {"copy_id": copy_id, "path": path})
+                return {"copy_id": copy_id, "path": path, "state": "corrupt"}
+            except Exception:
+                conn.rollback()
+                raise
 
     def migrate(self, actor_id: str, version_id: int, source_path: str, target_path: str, target_format: str, content_b64: str) -> dict:
         with self.connect() as conn:
@@ -406,16 +363,10 @@ class PreservationStore:
                     (source_version["archive_id"], version_no, actor_id, now()),
                 )
                 target_version_id = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO archive_files(version_id,path,sha256,size,content)
-                       SELECT ?,path,sha256,size,content FROM archive_files
-                       WHERE version_id=? AND path<>?""",
-                    (target_version_id, version_id, source_path),
-                )
-                conn.execute(
-                    "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
-                    (target_version_id, converted["path"], converted["sha256"], converted["size"], converted["content"]),
-                )
+                # 未转换文件沿用源版本的引用；转换产生的新文件按摘要共用实体。
+                clone_version_files(conn, version_id, target_version_id, exclude_path=source_path)
+                put_blob(conn, converted["sha256"], converted["size"], converted["content"])
+                register_version_file(conn, target_version_id, converted["path"], converted["sha256"], converted["size"])
                 conn.execute(
                     "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
                     (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
@@ -446,6 +397,23 @@ class PreservationStore:
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
 
+    # ---- 存储整理：残留实体预览与确认清理 ----
+
+    def storage_overview(self, user_id: str) -> dict:
+        with self.connect() as conn:
+            self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            return storage_gc.storage_overview(conn)
+
+    def list_orphan_blobs(self, user_id: str) -> dict:
+        with self.connect() as conn:
+            self._user(conn, user_id, {"owner", "archivist"})
+            return storage_gc.list_orphans(conn)
+
+    def purge_orphan_blobs(self, user_id: str) -> dict:
+        with self.connect() as conn:
+            self._user(conn, user_id, {"owner", "archivist"})
+            return storage_gc.purge_orphans(conn, user_id)
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Preservation/1.0"
@@ -471,18 +439,22 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_static(self, filename: str, content_type: str) -> None:
+        body = (BASE_DIR / "web" / filename).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _dispatch(self, method: str) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
         parts = [p for p in path.split("/") if p]
         user = self.headers.get("X-User-Id", "")
         if method == "GET" and path == "/":
-            body = (BASE_DIR / "web" / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._serve_static("index.html", "text/html; charset=utf-8")
+        if method == "GET" and path == "/static/storage.js":
+            return self._serve_static("storage.js", "application/javascript; charset=utf-8")
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
@@ -512,6 +484,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
+        if parts == ["api", "storage", "overview"] and method == "GET":
+            return self._send(200, store.storage_overview(user))
+        if parts == ["api", "storage", "orphans"] and method == "GET":
+            return self._send(200, store.list_orphan_blobs(user))
+        if parts == ["api", "storage", "purge"] and method == "POST":
+            return self._send(200, store.purge_orphan_blobs(user))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method: str) -> None:
@@ -545,11 +523,18 @@ def main() -> None:
     parser.add_argument("--seed", action="store_true")
     args = parser.parse_args()
     store = PreservationStore(args.db)
-    store.init_schema()
+    stats = store.init_schema()
     if args.seed:
         store.seed()
     if args.init or args.seed:
-        print(f"数据库已初始化: {args.db}")
+        if stats.get("mode") == "migrated":
+            print(
+                f"历史数据已迁到内容共用结构: {args.db}；实体 {stats['entities']} 个 / "
+                f"{stats['entity_bytes']} 字节，引用 {stats['references']} 条，"
+                f"去重节省 {stats['saved_bytes']} 字节"
+            )
+        else:
+            print(f"数据库已初始化: {args.db}")
         return
     print(f"数字档案服务运行于 http://127.0.0.1:{args.port}")
     server = PreservationServer(("127.0.0.1", args.port), store)
